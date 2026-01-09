@@ -1,0 +1,8 @@
+{
+  "name": "ai-vfx-backend",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "replicate": "^0.33.0"
+  }
+}
