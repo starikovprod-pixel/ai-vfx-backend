@@ -3,18 +3,34 @@ import Replicate from "replicate";
 import { PRESETS } from "../lib/presets.js";
 import { bunnyUpload, bunnyPublicUrl } from "../lib/bunny.js";
 
-export const config = { api: { bodyParser: false } };
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
+// helper для formidable
 function parseForm(req) {
   return new Promise((resolve, reject) => {
     const form = formidable({ multiples: false });
-    form.parse(req, (err, fields, files) =>
-      err ? reject(err) : resolve({ fields, files })
-    );
+    form.parse(req, (err, fields, files) => {
+      if (err) reject(err);
+      else resolve({ fields, files });
+    });
   });
 }
 
 export default async function handler(req, res) {
+  // ===== CORS =====
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // preflight
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "POST only" });
   }
@@ -35,57 +51,34 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Image required" });
     }
 
-    const {
-      REPLICATE_API_TOKEN,
-      REPLICATE_MODEL,
-      BUNNY_STORAGE_ZONE,
-      BUNNY_STORAGE_PASSWORD,
-      BUNNY_PULL_ZONE_URL,
-      BUNNY_REGION = "global"
-    } = process.env;
+    // upload image to bunny
+    const inputImageUrl = await bunnyUpload(
+      imageFile.filepath,
+      `inputs/${Date.now()}-${imageFile.originalFilename}`
+    );
 
-    if (!REPLICATE_API_TOKEN || !REPLICATE_MODEL) {
-      return res.status(500).json({ error: "Replicate env missing" });
-    }
-
-    const fs = await import("node:fs/promises");
-    const buffer = await fs.readFile(imageFile.filepath);
-
-    const inputPath = `inputs/${Date.now()}-${Math.random()
-      .toString(16)
-      .slice(2)}.png`;
-
-    await bunnyUpload({
-      storageZone: BUNNY_STORAGE_ZONE,
-      storagePassword: BUNNY_STORAGE_PASSWORD,
-      region: BUNNY_REGION,
-      remotePath: inputPath,
-      buffer,
-      contentType: "image/png"
+    const replicate = new Replicate({
+      auth: process.env.REPLICATE_API_TOKEN,
     });
-
-    const imageUrl = bunnyPublicUrl(BUNNY_PULL_ZONE_URL, inputPath);
-
-    const replicate = new Replicate({ auth: REPLICATE_API_TOKEN });
-
-    const prompt = preset.promptTemplate.replace("{scene}", scene);
 
     const prediction = await replicate.predictions.create({
-      model: REPLICATE_MODEL,
+      version: preset.version,
       input: {
-        image: imageUrl,
-        prompt,
-        negative_prompt: preset.negative,
-        fps: preset.fps,
-        duration: preset.duration
-      }
+        ...preset.input,
+        image: inputImageUrl,
+        prompt: scene,
+      },
     });
 
-    return res.json({
+    return res.status(200).json({
+      ok: true,
       jobId: prediction.id,
-      status: prediction.status
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error(err);
+    return res.status(500).json({
+      error: "Internal error",
+      details: String(err),
+    });
   }
 }
