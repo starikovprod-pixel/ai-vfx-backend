@@ -1,3 +1,4 @@
+import { pool } from "../lib/db.js";
 import fs from "fs";
 import formidable from "formidable";
 import Replicate from "replicate";
@@ -47,6 +48,8 @@ export default async function handler(req, res) {
   try {
     const missing = [];
     if (!process.env.REPLICATE_API_TOKEN) missing.push("REPLICATE_API_TOKEN");
+    // POSTGRES_URL должен быть в env (ты уже подключил Neon — переменная есть)
+    if (!process.env.POSTGRES_URL) missing.push("POSTGRES_URL");
     if (missing.length) return res.status(400).json({ error: "Missing env vars", missing });
 
     const { fields, files } = await parseForm(req);
@@ -68,6 +71,10 @@ export default async function handler(req, res) {
       .replaceAll("{scene}", scene)
       .trim();
 
+    const duration = Number(fields.duration || preset.duration || 5);
+    const aspectRatio = String(fields.aspect_ratio || preset.aspect_ratio || "16:9");
+    const hasAudio = String(fields.generate_audio || preset.generate_audio || "false") === "true";
+
     const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 
     const prediction = await replicate.predictions.create({
@@ -75,11 +82,36 @@ export default async function handler(req, res) {
       input: {
         prompt,
         start_image: startImage,
-        duration: Number(fields.duration || preset.duration || 5),
-        aspect_ratio: String(fields.aspect_ratio || preset.aspect_ratio || "16:9"),
-        generate_audio: String(fields.generate_audio || preset.generate_audio || "false") === "true",
+        duration,
+        aspect_ratio: aspectRatio,
+        generate_audio: hasAudio,
       },
     });
+
+    // ✅ СОХРАНЯЕМ В БАЗУ (библиотека генераций)
+    await pool.query(
+      `
+      insert into generations (
+        replicate_prediction_id,
+        model,
+        prompt,
+        status,
+        duration,
+        aspect_ratio,
+        has_audio
+      )
+      values ($1, $2, $3, $4, $5, $6, $7)
+      `,
+      [
+        prediction.id,
+        preset.model,
+        prompt,
+        prediction.status,
+        duration,
+        aspectRatio,
+        hasAudio,
+      ]
+    );
 
     return res.status(200).json({
       ok: true,
