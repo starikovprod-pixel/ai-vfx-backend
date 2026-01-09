@@ -1,3 +1,5 @@
+console.log("START TOKEN PREFIX:", (process.env.REPLICATE_API_TOKEN || "").slice(0, 6));
+
 import fs from "fs";
 import formidable from "formidable";
 import Replicate from "replicate";
