@@ -1,9 +1,9 @@
 {
   "name": "ai-vfx-backend",
-  "version": "1.0.0",
+  "private": true,
   "type": "module",
   "dependencies": {
-    "replicate": "^0.25.2",
-    "formidable": "^3.5.2"
+    "formidable": "^3.5.2",
+    "replicate": "^0.25.2"
   }
 }
