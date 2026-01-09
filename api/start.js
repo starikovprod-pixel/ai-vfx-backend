@@ -1,84 +1,91 @@
+import Replicate from "replicate";
 import fs from "fs";
 import formidable from "formidable";
-import Replicate from "replicate";
-import { PRESETS } from "../lib/presets.js";
-import { bunnyUpload } from "../lib/bunny.js";
+import { PRESETS } from "../presets.js"; // поправь путь, если у тебя иначе
 
 export const config = {
-  api: { bodyParser: false },
+  api: { bodyParser: false }, // ОБЯЗАТЕЛЬНО для multipart/form-data
 };
 
-// helper for formidable
 function parseForm(req) {
+  const form = formidable({
+    multiples: false,
+    keepExtensions: true,
+  });
+
   return new Promise((resolve, reject) => {
-    const form = formidable({ multiples: false });
     form.parse(req, (err, fields, files) => {
-      if (err) reject(err);
-      else resolve({ fields, files });
+      if (err) return reject(err);
+      resolve({ fields, files });
     });
   });
 }
 
+function pickFile(files, key) {
+  // formidable может вернуть либо объект, либо массив
+  const f = files?.[key];
+  if (!f) return null;
+  return Array.isArray(f) ? f[0] : f;
+}
+
 export default async function handler(req, res) {
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-
-  // DEBUG (safe)
-  const token = process.env.REPLICATE_API_TOKEN || "";
-  console.log("START: HAS TOKEN?", !!token, "PREFIX:", token ? token.slice(0, 6) : "none");
-
-  // env check (optional but helpful)
-  const missing = [];
-  if (!process.env.REPLICATE_API_TOKEN) missing.push("REPLICATE_API_TOKEN");
-  if (!process.env.BUNNY_STORAGE_ZONE) missing.push("BUNNY_STORAGE_ZONE");
-  if (!process.env.BUNNY_STORAGE_API_KEY) missing.push("BUNNY_STORAGE_API_KEY");
-  if (!process.env.BUNNY_REGION) missing.push("BUNNY_REGION");
-  if (missing.length) return res.status(400).json({ error: "Missing env vars", missing });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   try {
+    // мини-лог, чтобы понимать, видит ли Vercel токен (в логах Vercel)
+    console.log("HAS REPLICATE TOKEN?", !!process.env.REPLICATE_API_TOKEN);
+
     const { fields, files } = await parseForm(req);
 
-    const presetId = String(fields.presetId || "").trim();
-    const scene = String(fields.scene || "").trim();
+    const presetId = String(fields.presetId || "");
+    const scene = String(fields.scene || "");
+    const duration = fields.duration ? Number(fields.duration) : undefined;
+    const aspect_ratio = fields.aspect_ratio ? String(fields.aspect_ratio) : undefined;
+    const generate_audio =
+      fields.generate_audio != null
+        ? String(fields.generate_audio) === "true"
+        : undefined;
 
-    const preset = PRESETS[presetId];
-    if (!preset) return res.status(400).json({ error: "Unknown preset" });
+    if (!presetId) return res.status(400).json({ error: "presetId required" });
 
-    const imageFile = files.image;
-    if (!imageFile) return res.status(400).json({ error: "Image required (field name: image)" });
+    const preset = PRESETS?.[presetId];
+    if (!preset) return res.status(400).json({ error: `Unknown presetId: ${presetId}` });
 
-    // upload image to Bunny -> URL
-    const inputImageUrl = await bunnyUpload({
-      storageZone: process.env.BUNNY_STORAGE_ZONE,
-      storagePassword: process.env.BUNNY_STORAGE_API_KEY,
-      region: process.env.BUNNY_REGION || "global",
-      remotePath: `inputs/${Date.now()}-${imageFile.originalFilename || "image"}`,
-      buffer: fs.readFileSync(imageFile.filepath),
-      contentType: imageFile.mimetype || "image/png",
+    // важно: бекенд ждёт поле image (не start_image)
+    const file = pickFile(files, "image");
+    if (!file) return res.status(400).json({ error: "Image required (field name: image)" });
+
+    // у formidable бывает filepath (новое) или path (старое)
+    const filePath = file.filepath || file.path;
+    if (!filePath) {
+      console.log("FILES DEBUG:", Object.keys(files || {}), file);
+      return res.status(400).json({ error: "Failed to read uploaded file path" });
+    }
+
+    const imageBuffer = fs.readFileSync(filePath);
+
+    const replicate = new Replicate({
+      auth: process.env.REPLICATE_API_TOKEN,
     });
 
-    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+    // preset.model должен быть типа "kwaivgi/kling-v2.6"
+    // preset.modelVersion (если используешь) — конкретная версия, необязательно
+    const input = {
+      prompt: (preset.promptTemplate || "{scene}").replace("{scene}", scene || ""),
+      ...(preset.negative ? { negative_prompt: preset.negative } : {}),
+      ...(duration != null ? { duration } : preset.duration != null ? { duration: preset.duration } : {}),
+      ...(aspect_ratio ? { aspect_ratio } : {}),
+      ...(generate_audio != null ? { generate_audio } : {}),
+      // Kling принимает start_image. Но мы ему отдаём буфер как файл:
+      start_image: imageBuffer,
+    };
 
-    // IMPORTANT:
-    // Replicate требует model ИЛИ version.
-    // Для kwaivgi/kling-v2.6 норм использовать model.
+    // ВАЖНО: createPrediction нужен если хочешь prediction.id гарантированно
     const prediction = await replicate.predictions.create({
-      model: preset.model, // например "kwaivgi/kling-v2.6"
-      // version: preset.version, // если когда-то понадобится — можно добавить
-      input: {
-        ...(preset.input || {}),
-        prompt: preset.promptTemplate
-          ? preset.promptTemplate.replace("{scene}", scene || "")
-          : scene,
-        // Kling использует start_image (как на странице модели)
-        start_image: inputImageUrl,
-        // если у модели другое имя поля (image/start_image) — поправим в preset
-      },
+      model: preset.model,
+      input,
     });
 
     return res.status(200).json({
@@ -86,8 +93,6 @@ export default async function handler(req, res) {
       jobId: prediction.id,
       status: prediction.status,
       model: preset.model,
-      replicateGetUrl: prediction?.urls?.get || null,   // супер важно для дебага
-      replicateCancelUrl: prediction?.urls?.cancel || null,
     });
   } catch (err) {
     console.error("START ERROR:", err);
