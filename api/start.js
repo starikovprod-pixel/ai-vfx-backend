@@ -5,20 +5,17 @@ import { PRESETS } from "../lib/presets.js";
 import { bunnyUpload } from "../lib/bunny.js";
 
 export const config = {
-  api: { bodyParser: false },
+  api: {
+    bodyParser: false,
+  },
 };
 
-// helper для formidable
 function parseForm(req) {
   return new Promise((resolve, reject) => {
-    const form = formidable({
-      multiples: false,
-      keepExtensions: true,
-    });
-
+    const form = formidable({ multiples: false });
     form.parse(req, (err, fields, files) => {
-      if (err) return reject(err);
-      resolve({ fields, files });
+      if (err) reject(err);
+      else resolve({ fields, files });
     });
   });
 }
@@ -29,84 +26,78 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // preflight
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "POST only" });
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
   try {
-    // --- env check (чтобы сразу было понятно, чего не хватает) ---
-    const requiredEnv = [
-      "BUNNY_STORAGE_ZONE",
-      "BUNNY_STORAGE_API_KEY",
-      "REPLICATE_API_TOKEN",
-    ];
-    const missing = requiredEnv.filter((k) => !process.env[k]);
-    if (missing.length) {
-      return res.status(500).json({
-        error: "Missing env vars",
-        missing,
-      });
-    }
-
     const { fields, files } = await parseForm(req);
 
-    // поля из form-data
+    // ВАЖНО: ключ именно presetId (как ты и отправляешь)
     const presetId = String(fields.presetId || "");
     const scene = String(fields.scene || "a cinematic scene");
 
-    const preset = PRESETS[presetId];
+    const preset = PRESETS?.[presetId];
+
     if (!preset) {
       return res.status(400).json({
         error: "Unknown preset",
-        got: presetId,
-        allowed: Object.keys(PRESETS),
+        presetId,
+        available: Object.keys(PRESETS || {}),
       });
     }
 
-    // файл
-    let imageFile = files.image;
-    if (Array.isArray(imageFile)) imageFile = imageFile[0];
+    // Replicate требует EITHER version OR model
+    const version = preset.version ? String(preset.version) : "";
+    const model = preset.model ? String(preset.model) : "";
 
-    if (!imageFile || !imageFile.filepath) {
+    if (!version && !model) {
+      return res.status(500).json({
+        error: "Preset misconfigured: missing `version` or `model`",
+        presetId,
+        presetKeys: Object.keys(preset || {}),
+        hint:
+          "Open lib/presets.js and add `version: \"...\"` (or `model: \"owner/model\"`) for this preset.",
+      });
+    }
+
+    const imageFile = files?.image;
+    if (!imageFile) {
       return res.status(400).json({ error: "Image required" });
     }
 
-    // upload image to Bunny (ВАЖНО: bunnyUpload ждёт ОБЪЕКТ)
-    const remoteName = imageFile.originalFilename || "input.png";
-    const remotePath = `inputs/${Date.now()}-${remoteName}`;
-
+    // upload image to BunnyCDN (в твоём текущем стиле — URL возвращается из bunnyUpload)
     const inputImageUrl = await bunnyUpload({
       storageZone: process.env.BUNNY_STORAGE_ZONE,
       storagePassword: process.env.BUNNY_STORAGE_API_KEY,
       region: process.env.BUNNY_REGION || "global",
-      remotePath,
+      remotePath: `inputs/${Date.now()}-${imageFile.originalFilename}`,
       buffer: fs.readFileSync(imageFile.filepath),
-      contentType: imageFile.mimetype || "image/png",
+      contentType: imageFile.mimetype || "application/octet-stream",
     });
 
     const replicate = new Replicate({
       auth: process.env.REPLICATE_API_TOKEN,
     });
 
-    // создаём prediction
-    const prediction = await replicate.predictions.create({
-      version: preset.version,
-      input: {
-        ...preset.input,
-        image: inputImageUrl,
-        prompt: scene,
-      },
-    });
+    // Собираем input: базовый preset.input + image + prompt
+    const input = {
+      ...(preset.input || {}),
+      image: inputImageUrl,
+      prompt: scene,
+    };
+
+    // Вариант A: если есть version
+    // Вариант B: если есть model (на всякий случай)
+    const payload = version
+      ? { version, input }
+      : { model, input };
+
+    const prediction = await replicate.predictions.create(payload);
 
     return res.status(200).json({
       ok: true,
+      presetId,
       jobId: prediction.id,
-      inputImageUrl,
     });
   } catch (err) {
     console.error(err);
@@ -116,4 +107,3 @@ export default async function handler(req, res) {
     });
   }
 }
-
