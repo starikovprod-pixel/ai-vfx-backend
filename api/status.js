@@ -2,21 +2,20 @@ import { pool } from "../lib/db.js";
 import Replicate from "replicate";
 
 function pickOutputUrl(output) {
-  // Replicate иногда отдаёт output как строку, иногда как массив ссылок, иногда как объект.
   if (!output) return null;
 
   if (typeof output === "string") return output;
 
   if (Array.isArray(output)) {
-    // чаще всего Kling отдаёт массив, где [0] = mp4 url
-    const first = output.find((x) => typeof x === "string") || null;
-    return first;
+    return output.find((x) => typeof x === "string") || null;
   }
 
   if (typeof output === "object") {
-    // на всякий случай, если будет { video: "..."} или { url: "..." }
     if (typeof output.video === "string") return output.video;
     if (typeof output.url === "string") return output.url;
+
+    // иногда может быть вложенно
+    if (output.output && typeof output.output === "string") return output.output;
   }
 
   return null;
@@ -39,36 +38,52 @@ export default async function handler(req, res) {
     const jobId = String(req.query.jobId || "").trim();
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
 
+    // если хочешь — можешь передавать userId с фронта, но это не обязательно
+    const userId = req.query.userId ? String(req.query.userId).trim() : null;
+
     const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 
-    // получаем актуальный статус из Replicate
     const prediction = await replicate.predictions.get(jobId);
 
     const outputUrl = pickOutputUrl(prediction.output);
-    const errText =
-      prediction.error ? String(prediction.error) : null;
+    const errText = prediction.error ? String(prediction.error) : null;
 
-    // ✅ сохраняем/обновляем запись в БД
-    // Важно: у тебя уже есть unique index по replicate_prediction_id
-    await pool.query(
-      `
-      insert into generations (replicate_prediction_id, status, output_url, error)
-      values ($1, $2, $3, $4)
-      on conflict (replicate_prediction_id)
-      do update set
-        status = excluded.status,
-        output_url = coalesce(excluded.output_url, generations.output_url),
-        error = excluded.error,
-        updated_at = now()
-      `,
-      [jobId, prediction.status, outputUrl, errText]
-    );
+    // Пишем в ТУ колонку, которая реально есть: output_video_url
+    // И НЕ трогаем updated_at (чтобы не падать, если колонки нет)
+    // Если userId не пришел — сохраняем/обновляем без user_id.
+    if (userId) {
+      await pool.query(
+        `
+        insert into generations (user_id, replicate_prediction_id, status, output_video_url, error)
+        values ($1, $2, $3, $4, $5)
+        on conflict (replicate_prediction_id)
+        do update set
+          status = excluded.status,
+          output_video_url = coalesce(excluded.output_video_url, generations.output_video_url),
+          error = excluded.error
+        `,
+        [userId, jobId, prediction.status, outputUrl, errText]
+      );
+    } else {
+      await pool.query(
+        `
+        insert into generations (replicate_prediction_id, status, output_video_url, error)
+        values ($1, $2, $3, $4)
+        on conflict (replicate_prediction_id)
+        do update set
+          status = excluded.status,
+          output_video_url = coalesce(excluded.output_video_url, generations.output_video_url),
+          error = excluded.error
+        `,
+        [jobId, prediction.status, outputUrl, errText]
+      );
+    }
 
     return res.status(200).json({
       ok: true,
       jobId,
       status: prediction.status,
-      output: outputUrl,      // <-- вот это покажем на фронте как "скачать"
+      output: outputUrl,
       error: errText,
     });
   } catch (err) {
@@ -79,3 +94,4 @@ export default async function handler(req, res) {
     });
   }
 }
+
