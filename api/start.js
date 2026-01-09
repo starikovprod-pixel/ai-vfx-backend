@@ -5,9 +5,7 @@ import { PRESETS } from "../lib/presets.js";
 import { bunnyUpload } from "../lib/bunny.js";
 
 export const config = {
-  api: {
-    bodyParser: false,
-  },
+  api: { bodyParser: false },
 };
 
 function parseForm(req) {
@@ -20,8 +18,13 @@ function parseForm(req) {
   });
 }
 
+function missingEnv(names) {
+  const missing = names.filter((k) => !process.env[k] || String(process.env[k]).trim() === "");
+  return missing;
+}
+
 export default async function handler(req, res) {
-  // ===== CORS =====
+  // ---- CORS ----
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -29,81 +32,69 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
+  // ---- ENV CHECK ----
+  const missing = missingEnv([
+    "REPLICATE_API_TOKEN",
+    "BUNNY_STORAGE_ZONE",
+    "BUNNY_STORAGE_API_KEY",
+    "BUNNY_REGION",
+  ]);
+
+  if (missing.length) {
+    return res.status(500).json({ error: "Missing env vars", missing });
+  }
+
   try {
     const { fields, files } = await parseForm(req);
 
-    // ВАЖНО: ключ именно presetId (как ты и отправляешь)
     const presetId = String(fields.presetId || "");
     const scene = String(fields.scene || "a cinematic scene");
 
-    const preset = PRESETS?.[presetId];
+    const preset = PRESETS[presetId];
+    if (!preset) return res.status(400).json({ error: "Unknown preset", presetId });
 
-    if (!preset) {
-      return res.status(400).json({
-        error: "Unknown preset",
-        presetId,
-        available: Object.keys(PRESETS || {}),
-      });
-    }
+    const imageFile = files.image;
+    if (!imageFile) return res.status(400).json({ error: "Image required" });
 
-    // Replicate требует EITHER version OR model
-    const version = preset.version ? String(preset.version) : "";
-    const model = preset.model ? String(preset.model) : "";
+    // ---- upload image to Bunny ----
+    const buffer = fs.readFileSync(imageFile.filepath);
+    const remotePath = `inputs/${Date.now()}-${imageFile.originalFilename || "image.png"}`;
 
-    if (!version && !model) {
-      return res.status(500).json({
-        error: "Preset misconfigured: missing `version` or `model`",
-        presetId,
-        presetKeys: Object.keys(preset || {}),
-        hint:
-          "Open lib/presets.js and add `version: \"...\"` (or `model: \"owner/model\"`) for this preset.",
-      });
-    }
-
-    const imageFile = files?.image;
-    if (!imageFile) {
-      return res.status(400).json({ error: "Image required" });
-    }
-
-    // upload image to BunnyCDN (в твоём текущем стиле — URL возвращается из bunnyUpload)
     const inputImageUrl = await bunnyUpload({
       storageZone: process.env.BUNNY_STORAGE_ZONE,
       storagePassword: process.env.BUNNY_STORAGE_API_KEY,
       region: process.env.BUNNY_REGION || "global",
-      remotePath: `inputs/${Date.now()}-${imageFile.originalFilename}`,
-      buffer: fs.readFileSync(imageFile.filepath),
+      remotePath,
+      buffer,
       contentType: imageFile.mimetype || "application/octet-stream",
     });
 
-    const replicate = new Replicate({
-      auth: process.env.REPLICATE_API_TOKEN,
-    });
+    // ---- Replicate run (как в примере на сайте) ----
+    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 
-    // Собираем input: базовый preset.input + image + prompt
     const input = {
       ...(preset.input || {}),
-      image: inputImageUrl,
       prompt: scene,
+      // ВАЖНО: проверь в Schema, как называется поле:
+      start_image: inputImageUrl,
+      // если в Schema поле называется image -> замени на:
+      // image: inputImageUrl,
     };
 
-    // Вариант A: если есть version
-    // Вариант B: если есть model (на всякий случай)
-    const payload = version
-      ? { version, input }
-      : { model, input };
-
-    const prediction = await replicate.predictions.create(payload);
+    const output = await replicate.run(preset.model, { input });
 
     return res.status(200).json({
       ok: true,
       presetId,
-      jobId: prediction.id,
+      model: preset.model,
+      inputImageUrl,
+      output,
     });
   } catch (err) {
     console.error(err);
     return res.status(500).json({
       error: "Internal error",
-      details: String(err?.stack || err),
+      details: String(err?.stack || err?.message || err),
     });
   }
 }
