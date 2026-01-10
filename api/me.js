@@ -69,8 +69,10 @@ export default async function handler(req, res) {
     try {
       const gens = await pool.query(
         `
-        select id, status, output_url, created_at
-        from generations
+        SELECT id, status,
+       COALESCE(output_url, output_video_url) AS output_url,
+       created_at
+       FROM generations
         where user_id = $1
         order by created_at desc
         limit 24
