@@ -3,14 +3,42 @@ import fs from "fs";
 import formidable from "formidable";
 import Replicate from "replicate";
 import { PRESETS } from "../lib/presets.js";
-import crypto from "crypto";
 
 // Vercel / Next API config: allow multipart
 export const config = {
-  api: {
-    bodyParser: false,
-  },
+  api: { bodyParser: false },
 };
+
+// ===== Supabase token -> user =====
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+async function getUserFromBearer(req) {
+  const auth = req.headers.authorization || req.headers.Authorization || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return { user: null, error: "NO_BEARER_TOKEN" };
+
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return { user: null, error: "SUPABASE_ENV_MISSING" };
+  }
+
+  const token = m[1].trim();
+  const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: "GET",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    return { user: null, error: `SUPABASE_AUTH_FAILED:${r.status}:${txt}` };
+  }
+
+  const user = await r.json(); // { id, email, ... }
+  return { user, error: null, token };
+}
 
 function parseForm(req) {
   const form = formidable({
@@ -46,8 +74,11 @@ export default async function handler(req, res) {
   // ---- CORS ----
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  // добавил X-User-Id на будущее (если решишь слать из фронта)
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-User-Id");
+  // ВАЖНО: добавили Authorization
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST")
@@ -57,9 +88,21 @@ export default async function handler(req, res) {
     const missing = [];
     if (!process.env.REPLICATE_API_TOKEN) missing.push("REPLICATE_API_TOKEN");
     if (!process.env.POSTGRES_URL) missing.push("POSTGRES_URL");
+    if (!process.env.SUPABASE_URL) missing.push("SUPABASE_URL");
+    if (!process.env.SUPABASE_ANON_KEY) missing.push("SUPABASE_ANON_KEY");
     if (missing.length)
       return res.status(400).json({ error: "Missing env vars", missing });
 
+    // ✅ 1) AUTH: получаем юзера из Bearer токена
+    const { user, error: authError } = await getUserFromBearer(req);
+    if (!user) {
+      return res.status(401).json({ ok: false, error: authError });
+    }
+
+    const userId = user.id;          // <-- главный правильный user_id
+    const email = user.email || null;
+
+    // ✅ 2) multipart form
     const { fields, files } = await parseForm(req);
 
     const presetId = String(fields.presetId || "").trim();
@@ -68,7 +111,9 @@ export default async function handler(req, res) {
     ).trim();
 
     const preset = PRESETS[presetId];
-    if (!preset) return res.status(400).json({ error: "Unknown preset", presetId });
+    if (!preset) {
+      return res.status(400).json({ error: "Unknown preset", presetId });
+    }
 
     const imageFile = pickFile(files.image);
     if (!imageFile) {
@@ -77,18 +122,15 @@ export default async function handler(req, res) {
         .json({ error: "Image required (field name must be 'image')" });
     }
 
-    // --- user_id (НЕ NULL) ---
-    // 1) если фронт прислал fields.user_id — используем
-    // 2) иначе генерим на сервере (красиво и стабильно для БД)
-    const userIdFromForm = String(fields.user_id || "").trim();
-    const userIdFromHeader = String(req.headers["x-user-id"] || "").trim();
-    const userId = userIdFromForm || userIdFromHeader || crypto.randomUUID();
-
     const startImage = fileToDataUri(imageFile);
 
     const prompt = (preset.promptTemplate || "{scene}")
       .replaceAll("{scene}", scene)
       .trim();
+
+    if (!prompt) {
+      return res.status(400).json({ error: "Prompt required" });
+    }
 
     const duration = Number(fields.duration || preset.duration || 5);
     const aspectRatio = String(fields.aspect_ratio || preset.aspect_ratio || "16:9");
@@ -107,12 +149,12 @@ export default async function handler(req, res) {
       },
     });
 
-    // ✅ СОХРАНЯЕМ В БАЗУ (generations)
-    // ВАЖНО: колонка в БД у тебя называется generate_audio (а не has_audio)
+    // ✅ 3) SAVE to DB, ПРИВЯЗАНО К user.id
     await pool.query(
       `
       insert into generations (
         user_id,
+        email,
         preset_id,
         replicate_prediction_id,
         model,
@@ -122,10 +164,11 @@ export default async function handler(req, res) {
         aspect_ratio,
         generate_audio
       )
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       `,
       [
         userId,
+        email,
         presetId,
         prediction.id,
         preset.model,
@@ -139,7 +182,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      userId, // 👈 вернём, чтобы фронт мог сохранить и слать дальше
+      user: { id: userId, email },
       jobId: prediction.id,
       status: prediction.status,
       model: preset.model,
@@ -152,4 +195,3 @@ export default async function handler(req, res) {
     });
   }
 }
-
