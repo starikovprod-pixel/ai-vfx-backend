@@ -51,8 +51,12 @@ export default async function handler(req, res) {
     `);
 
     // ---- DIAG: есть ли таблица user_balances ----
-    const reg = await pool.query(`select to_regclass('public.user_balances') as t`);
-    const hasBalancesTable = !!reg.rows?.[0]?.t;
+    const regBalances = await pool.query(`select to_regclass('public.user_balances') as t`);
+    const hasBalancesTable = !!regBalances.rows?.[0]?.t;
+
+    // ---- DIAG: есть ли таблица user_profiles ----
+    const regProfiles = await pool.query(`select to_regclass('public.user_profiles') as t`);
+    const hasProfilesTable = !!regProfiles.rows?.[0]?.t;
 
     // ---- credits: НИКОГДА не падаем ----
     let credits = 0;
@@ -64,18 +68,41 @@ export default async function handler(req, res) {
       credits = bal.rows[0]?.credits ?? 0;
     }
 
+    // ---- has_password: по флажку в user_profiles ----
+    let has_password = false;
+    if (hasProfilesTable) {
+      // ensure row exists
+      await pool.query(
+        `insert into public.user_profiles (user_id)
+         values ($1)
+         on conflict (user_id) do nothing`,
+        [userId]
+      );
+
+      const p = await pool.query(
+        `select has_password from public.user_profiles where user_id = $1 limit 1`,
+        [userId]
+      );
+      has_password = !!p.rows?.[0]?.has_password;
+    } else {
+      // если таблицы ещё нет — просто считаем, что пароля нет
+      has_password = false;
+    }
+
     // ---- generations: тоже не падаем ----
     let generations = [];
     try {
       const gens = await pool.query(
         `
-        SELECT id, status,
-       COALESCE(output_url, output_video_url) AS output_url,
-       created_at
-       FROM generations
-        where user_id = $1
-        order by created_at desc
-        limit 24
+        SELECT
+          id,
+          status,
+          COALESCE(output_url, output_video_url) AS output_url,
+          created_at
+        FROM public.generations
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 24
         `,
         [userId]
       );
@@ -88,10 +115,12 @@ export default async function handler(req, res) {
       ok: true,
       user: { id: userId, email },
       credits,
+      has_password,
       generations,
       debug: {
         db: diag.rows?.[0] || null,
         hasBalancesTable,
+        hasProfilesTable,
       },
     });
   } catch (e) {
@@ -99,3 +128,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Internal error", details: String(e?.message || e) });
   }
 }
+
