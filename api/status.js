@@ -89,15 +89,16 @@ export default async function handler(req, res) {
     const outputUrl = pickOutputUrl(prediction);
 
     await pool.query(
-      `
-      UPDATE generations
-      SET status = $1,
-          output_url = COALESCE($2, output_url)
-      WHERE user_id = $3
-        AND replicate_prediction_id = $4
-      `,
-      [prediction.status, outputUrl, userId, jobId]
-    );
+  `
+  UPDATE generations
+  SET status = $1,
+      output_url = COALESCE($2, output_url),
+      output_video_url = COALESCE($2, output_video_url)
+  WHERE replicate_prediction_id = $3
+  `,
+  [prediction.status, outputUrl, jobId]
+);
+
 
     return res.status(200).json({
       ok: true,
