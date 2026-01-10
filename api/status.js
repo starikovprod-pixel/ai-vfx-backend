@@ -3,19 +3,12 @@ import Replicate from "replicate";
 
 function pickOutputUrl(output) {
   if (!output) return null;
-
   if (typeof output === "string") return output;
-
-  if (Array.isArray(output)) {
-    const first = output.find((x) => typeof x === "string") || null;
-    return first;
-  }
-
+  if (Array.isArray(output)) return output.find((x) => typeof x === "string") || null;
   if (typeof output === "object") {
     if (typeof output.video === "string") return output.video;
     if (typeof output.url === "string") return output.url;
   }
-
   return null;
 }
 
@@ -37,26 +30,35 @@ export default async function handler(req, res) {
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
 
     const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-
-    // 1) актуальный статус из Replicate
     const prediction = await replicate.predictions.get(jobId);
 
     const outputUrl = pickOutputUrl(prediction.output);
     const errText = prediction.error ? String(prediction.error) : null;
 
-    // 2) пишем в БД (ВАЖНО: у тебя колонка называется output_video_url)
-    await pool.query(
+    // ✅ ТОЛЬКО UPDATE (никаких INSERT)
+    const r = await pool.query(
       `
-      insert into generations (replicate_prediction_id, status, output_video_url, error)
-      values ($1, $2, $3, $4)
-      on conflict (replicate_prediction_id)
-      do update set
-        status = excluded.status,
-        output_video_url = coalesce(excluded.output_video_url, generations.output_video_url),
-        error = excluded.error
+      UPDATE generations
+      SET
+        status = $2,
+        output_video_url = COALESCE($3, output_video_url),
+        error = $4
+      WHERE replicate_prediction_id = $1
+      RETURNING id
       `,
       [jobId, prediction.status, outputUrl, errText]
     );
+
+    if (r.rowCount === 0) {
+      // Если строки нет — это проблема старта (или база другая)
+      return res.status(404).json({
+        ok: false,
+        error: "Generation not found in DB for this jobId. Start endpoint probably didn't insert it.",
+        jobId,
+        status: prediction.status,
+        output: outputUrl,
+      });
+    }
 
     return res.status(200).json({
       ok: true,
@@ -73,3 +75,4 @@ export default async function handler(req, res) {
     });
   }
 }
+
