@@ -3,21 +3,12 @@ import Replicate from "replicate";
 
 function pickOutputUrl(output) {
   if (!output) return null;
-
   if (typeof output === "string") return output;
-
-  if (Array.isArray(output)) {
-    return output.find((x) => typeof x === "string") || null;
-  }
-
+  if (Array.isArray(output)) return output.find((x) => typeof x === "string") || null;
   if (typeof output === "object") {
     if (typeof output.video === "string") return output.video;
     if (typeof output.url === "string") return output.url;
-
-    // иногда может быть вложенно
-    if (output.output && typeof output.output === "string") return output.output;
   }
-
   return null;
 }
 
@@ -38,46 +29,40 @@ export default async function handler(req, res) {
     const jobId = String(req.query.jobId || "").trim();
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
 
-    // если хочешь — можешь передавать userId с фронта, но это не обязательно
-    const userId = req.query.userId ? String(req.query.userId).trim() : null;
+    // 1) Сначала проверяем: есть ли такая генерация в БД
+    const exists = await pool.query(
+      `select id from generations where replicate_prediction_id = $1 limit 1`,
+      [jobId]
+    );
 
+    if (exists.rowCount === 0) {
+      // НЕ СОЗДАЁМ новую строку — иначе опять NOT NULL ад
+      return res.status(404).json({
+        ok: false,
+        error: "Unknown jobId in DB. Start endpoint must create row first.",
+        jobId,
+      });
+    }
+
+    // 2) Запрашиваем статус из Replicate
     const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-
     const prediction = await replicate.predictions.get(jobId);
 
     const outputUrl = pickOutputUrl(prediction.output);
     const errText = prediction.error ? String(prediction.error) : null;
 
-    // Пишем в ТУ колонку, которая реально есть: output_video_url
-    // И НЕ трогаем updated_at (чтобы не падать, если колонки нет)
-    // Если userId не пришел — сохраняем/обновляем без user_id.
-    if (userId) {
-      await pool.query(
-        `
-        insert into generations (user_id, replicate_prediction_id, status, output_video_url, error)
-        values ($1, $2, $3, $4, $5)
-        on conflict (replicate_prediction_id)
-        do update set
-          status = excluded.status,
-          output_video_url = coalesce(excluded.output_video_url, generations.output_video_url),
-          error = excluded.error
-        `,
-        [userId, jobId, prediction.status, outputUrl, errText]
-      );
-    } else {
-      await pool.query(
-        `
-        insert into generations (replicate_prediction_id, status, output_video_url, error)
-        values ($1, $2, $3, $4)
-        on conflict (replicate_prediction_id)
-        do update set
-          status = excluded.status,
-          output_video_url = coalesce(excluded.output_video_url, generations.output_video_url),
-          error = excluded.error
-        `,
-        [jobId, prediction.status, outputUrl, errText]
-      );
-    }
+    // 3) Только обновляем
+    await pool.query(
+      `
+      update generations
+      set
+        status = $2,
+        output_url = coalesce($3, output_url),
+        error = $4
+      where replicate_prediction_id = $1
+      `,
+      [jobId, prediction.status, outputUrl, errText]
+    );
 
     return res.status(200).json({
       ok: true,
