@@ -32,12 +32,11 @@ async function getUserFromSupabase(accessToken) {
 }
 
 function parseForm(req) {
-const form = formidable({
-  multiples: true,
-  keepExtensions: true,
-  maxFileSize: 20 * 1024 * 1024, // 20MB
-});
-
+  const form = formidable({
+    multiples: true,
+    keepExtensions: true,
+    maxFileSize: 200 * 1024 * 1024, // ✅ под видео лучше 200MB (ты грузишь 28MB)
+  });
 
   return new Promise((resolve, reject) => {
     form.parse(req, (err, fields, files) => {
@@ -79,10 +78,10 @@ export default async function handler(req, res) {
 
   try {
     const missing = [];
-    if (!process.env.REPLICATE_API_TOKEN) missing.push("REPLICATE_API_TOKEN");
     if (!process.env.POSTGRES_URL) missing.push("POSTGRES_URL");
     if (!SUPABASE_URL) missing.push("SUPABASE_URL");
     if (!SUPABASE_ANON_KEY) missing.push("SUPABASE_ANON_KEY");
+    // REPLICATE_API_TOKEN нужен только для kling/nano, FAL_KEY только для fal
     if (missing.length) return res.status(400).json({ error: "Missing env vars", missing });
 
     // AUTH
@@ -101,12 +100,14 @@ export default async function handler(req, res) {
     const preset = PRESETS[presetId];
     if (!preset) return res.status(400).json({ error: "Unknown preset", presetId });
 
-    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
-
     // -------------------------
-    // ✅ KLING (image required)
+    // ✅ KLING (Replicate, image required)
     // -------------------------
     if (preset.provider === "kling") {
+      if (!process.env.REPLICATE_API_TOKEN) {
+        return res.status(400).json({ error: "Missing env vars", missing: ["REPLICATE_API_TOKEN"] });
+      }
+
       const imageFile = pickFiles(files, "image")[0];
       if (!imageFile) {
         return res.status(400).json({ error: "Image required (field name must be 'image')" });
@@ -121,6 +122,7 @@ export default async function handler(req, res) {
       const aspectRatio = String(pickField(fields, "aspect_ratio") || preset.aspect_ratio || "16:9");
       const generateAudio = normalizeBool(pickField(fields, "generate_audio") ?? preset.generate_audio);
 
+      const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
       const prediction = await replicate.predictions.create({
         model: preset.model,
         input: {
@@ -152,99 +154,41 @@ export default async function handler(req, res) {
       });
     }
 
-    // -----------------------------------------
-    // ✅ NANO BANANA PRO (image optional, multi)
-    // -----------------------------------------
+    // -------------------------
+    // ✅ NANO (Replicate, image optional via URL)
+    // -------------------------
     if (preset.provider === "nano") {
+      if (!process.env.REPLICATE_API_TOKEN) {
+        return res.status(400).json({ error: "Missing env vars", missing: ["REPLICATE_API_TOKEN"] });
+      }
+
       const prompt = (preset.promptTemplate || "{scene}")
         .replaceAll("{scene}", scene || "high quality, detailed")
         .trim();
 
-// Nano: теперь принимаем URL (а не файл/base64)
-const image_input_url = String(pickField(fields, "image_input_url") || "").trim();
-const image_input = image_input_url ? [image_input_url] : undefined;
+      const image_input_url = String(pickField(fields, "image_input_url") || "").trim();
+      const image_input = image_input_url ? [image_input_url] : undefined;
 
-const aspect_ratio = String(pickField(fields, "aspect_ratio") || preset.aspect_ratio || "match_input_image");
-const resolution = String(pickField(fields, "resolution") || preset.resolution || "2K");
-const output_format = String(pickField(fields, "output_format") || preset.output_format || "png");
-const safety_filter_level = String(
-  pickField(fields, "safety_filter_level") || preset.safety_filter_level || "block_only_high"
-);
+      const aspect_ratio = String(pickField(fields, "aspect_ratio") || preset.aspect_ratio || "match_input_image");
+      const resolution = String(pickField(fields, "resolution") || preset.resolution || "2K");
+      const output_format = String(pickField(fields, "output_format") || preset.output_format || "png");
+      const safety_filter_level = String(
+        pickField(fields, "safety_filter_level") || preset.safety_filter_level || "block_only_high"
+      );
 
-const prediction = await replicate.predictions.create({
-  model: preset.model, // "google/nano-banana-pro"
-  input: {
-    prompt,
-    ...(image_input ? { image_input } : {}),
-    aspect_ratio,
-    resolution,
-    output_format,
-    safety_filter_level,
-  },
-});
+      const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+      const prediction = await replicate.predictions.create({
+        model: preset.model,
+        input: {
+          prompt,
+          ...(image_input ? { image_input } : {}),
+          aspect_ratio,
+          resolution,
+          output_format,
+          safety_filter_level,
+        },
+      });
 
-      if (preset.provider === "fal") {
-  if (!process.env.FAL_KEY) {
-    return res.status(400).json({ error: "Missing env vars", missing: ["FAL_KEY"] });
-  }
-
-  const prompt = (preset.promptTemplate || "{scene}")
-    .replaceAll("{scene}", scene || "edit the video")
-    .trim();
-
-  const video_url = String(pickField(fields, "video_url") || "").trim();
-  if (!video_url) {
-    return res.status(400).json({ error: "video_url required (public URL to mp4)" });
-  }
-
-  // optional toggles
-  const keep_original_sound = normalizeBool(pickField(fields, "keep_original_sound") ?? true);
-
-  // fal.ai API call (async)
-  const r = await fetch(`https://fal.run/${preset.model}`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Key ${process.env.FAL_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      prompt,
-      video_url,
-      keep_original_sound,
-    }),
-  });
-
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    return res.status(400).json({ error: "fal request failed", details: j });
-  }
-
-  // fal returns request_id for async jobs (обычно так)
-  const requestId = j.request_id || j.id || null;
-  if (!requestId) {
-    return res.status(400).json({ error: "fal: missing request_id", details: j });
-  }
-
-  await pool.query(
-    `
-    insert into public.generations
-      (user_id, preset_id, replicate_prediction_id, model, prompt, status)
-    values
-      ($1, $2, $3, $4, $5, $6)
-    `,
-    [userId, presetId, requestId, preset.model, prompt, "starting"]
-  );
-
-  return res.status(200).json({
-    ok: true,
-    jobId: requestId,
-    status: "starting",
-    provider: preset.provider,
-    presetId,
-  });
-}
-
-      
       await pool.query(
         `
         insert into public.generations
@@ -260,6 +204,68 @@ const prediction = await replicate.predictions.create({
         user: { id: userId, email },
         jobId: prediction.id,
         status: prediction.status,
+        provider: preset.provider,
+        presetId,
+      });
+    }
+
+    // -------------------------
+    // ✅ FAL (Kling O1 Edit)
+    // -------------------------
+    if (preset.provider === "fal") {
+      if (!process.env.FAL_KEY) {
+        return res.status(400).json({ error: "Missing env vars", missing: ["FAL_KEY"] });
+      }
+
+      const prompt = (preset.promptTemplate || "{scene}")
+        .replaceAll("{scene}", scene || "edit the video")
+        .trim();
+
+      const video_url = String(pickField(fields, "video_url") || "").trim();
+      if (!video_url) {
+        return res.status(400).json({ error: "video_url required (public URL to mp4)" });
+      }
+
+      const keep_original_sound = normalizeBool(pickField(fields, "keep_original_sound") ?? true);
+
+      const r = await fetch(`https://fal.run/${preset.model}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Key ${process.env.FAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          prompt,
+          video_url,
+          keep_original_sound,
+        }),
+      });
+
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        return res.status(400).json({ error: "fal request failed", details: j });
+      }
+
+      const requestId = j.request_id || j.id || null;
+      if (!requestId) {
+        return res.status(400).json({ error: "fal: missing request_id", details: j });
+      }
+
+      await pool.query(
+        `
+        insert into public.generations
+          (user_id, preset_id, replicate_prediction_id, model, prompt, status)
+        values
+          ($1, $2, $3, $4, $5, $6)
+        `,
+        [userId, presetId, requestId, preset.model, prompt, "starting"]
+      );
+
+      return res.status(200).json({
+        ok: true,
+        user: { id: userId, email },
+        jobId: requestId,
+        status: "starting",
         provider: preset.provider,
         presetId,
       });
