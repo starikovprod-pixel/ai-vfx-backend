@@ -10,9 +10,17 @@ function getBearerToken(req) {
 }
 
 async function getUserFromSupabase(accessToken) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
+  }
+
   const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-    headers: { Authorization: `Bearer ${accessToken}`, apikey: SUPABASE_ANON_KEY },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      apikey: SUPABASE_ANON_KEY,
+    },
   });
+
   if (!r.ok) {
     const txt = await r.text();
     throw new Error(`Supabase auth failed: ${r.status} ${txt}`);
@@ -20,10 +28,44 @@ async function getUserFromSupabase(accessToken) {
   return r.json();
 }
 
+async function falRequest(modelPath, payload) {
+  const url = `https://fal.run/${modelPath}`;
+
+  // try with "Key"
+  let r = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Key ${process.env.FAL_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  // if unauthorized, try with "Bearer"
+  if (r.status === 401 || r.status === 403) {
+    r = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.FAL_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  const text = await r.text();
+  let json = {};
+  try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+
+  return { ok: r.ok, status: r.status, json, text };
+}
+
 export default async function handler(req, res) {
+  // ✅ CORS — обязательно в самом начале
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -35,12 +77,15 @@ export default async function handler(req, res) {
     if (!process.env.FAL_KEY) missing.push("FAL_KEY");
     if (missing.length) return res.status(400).json({ error: "Missing env vars", missing });
 
+    // AUTH
     const token = getBearerToken(req);
     if (!token) return res.status(401).json({ error: "Missing Bearer token" });
+
     const user = await getUserFromSupabase(token);
     const userId = user.id;
     const email = user.email || null;
 
+    // body
     const body = req.body && typeof req.body === "object" ? req.body : {};
     const presetId = String(body.presetId || "").trim();
     const scene = String(body.scene || "").trim();
@@ -54,25 +99,31 @@ export default async function handler(req, res) {
     if (!preset) return res.status(400).json({ error: "Unknown preset", presetId });
     if (preset.provider !== "fal") return res.status(400).json({ error: "Preset is not fal", presetId });
 
-    const prompt = (preset.promptTemplate || "{scene}").replaceAll("{scene}", scene || "edit the video").trim();
+    const prompt = (preset.promptTemplate || "{scene}")
+      .replaceAll("{scene}", scene || "edit the video")
+      .trim();
 
-    // fal call
-    const r = await fetch(`https://fal.run/${preset.model}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Key ${process.env.FAL_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ prompt, video_url, keep_original_sound }),
+    // ✅ fal call
+    const fal = await falRequest(preset.model, {
+      prompt,
+      video_url,
+      keep_original_sound,
     });
 
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      return res.status(400).json({ error: "fal request failed", details: j });
+    if (!fal.ok) {
+      // возвращаем максимально полезную ошибку
+      return res.status(400).json({
+        error: "fal request failed",
+        status: fal.status,
+        details: fal.json && Object.keys(fal.json).length ? fal.json : fal.text,
+      });
     }
 
+    const j = fal.json || {};
     const requestId = j.request_id || j.id || null;
-    if (!requestId) return res.status(400).json({ error: "fal: missing request_id", details: j });
+    if (!requestId) {
+      return res.status(400).json({ error: "fal: missing request_id", details: j });
+    }
 
     await pool.query(
       `
