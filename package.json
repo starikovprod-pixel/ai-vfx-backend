@@ -6,5 +6,6 @@
     "formidable": "^3.5.2",
     "replicate": "^0.25.2",
     "pg": "^8.11.3"
+    "@supabase/supabase-js": "^2.x"
   }
 }
