@@ -1,8 +1,14 @@
+import fs from "fs";
+import formidable from "formidable";
+import { createClient } from "@supabase/supabase-js";
 import { pool } from "../lib/db.js";
 import { PRESETS } from "../lib/presets.js";
 
+export const config = { api: { bodyParser: false } };
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 function getBearerToken(req) {
   const auth = String(req.headers.authorization || "");
@@ -13,14 +19,9 @@ async function getUserFromSupabase(accessToken) {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
   }
-
   const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      apikey: SUPABASE_ANON_KEY,
-    },
+    headers: { Authorization: `Bearer ${accessToken}`, apikey: SUPABASE_ANON_KEY },
   });
-
   if (!r.ok) {
     const txt = await r.text();
     throw new Error(`Supabase auth failed: ${r.status} ${txt}`);
@@ -28,10 +29,63 @@ async function getUserFromSupabase(accessToken) {
   return r.json();
 }
 
+function parseForm(req) {
+  const form = formidable({
+    multiples: false,
+    keepExtensions: true,
+    maxFileSize: 200 * 1024 * 1024, // 200MB
+  });
+  return new Promise((resolve, reject) => {
+    form.parse(req, (err, fields, files) => {
+      if (err) return reject(err);
+      resolve({ fields, files });
+    });
+  });
+}
+
+function pickField(fields, name) {
+  const v = fields?.[name];
+  return Array.isArray(v) ? v[0] : v;
+}
+
+function pickFile(files, name) {
+  const f = files?.[name];
+  if (!f) return null;
+  return Array.isArray(f) ? f[0] : f;
+}
+
+function normalizeBool(v) {
+  return String(v ?? "false").toLowerCase() === "true";
+}
+
+async function uploadVideoToSupabase({ userId, file }) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  const buf = fs.readFileSync(file.filepath || file.path);
+  const ext = "mp4";
+  const path = `${userId}/${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`;
+
+  const { data, error } = await supabaseAdmin.storage
+    .from("inputs_video")
+    .upload(path, buf, {
+      upsert: false,
+      contentType: "video/mp4",
+      cacheControl: "3600",
+    });
+
+  if (error) throw error;
+
+  const { data: pub } = supabaseAdmin.storage.from("inputs_video").getPublicUrl(data.path);
+  return pub.publicUrl;
+}
+
 async function falRequest(modelPath, payload) {
   const url = `https://fal.run/${modelPath}`;
 
-  // try with "Key"
   let r = await fetch(url, {
     method: "POST",
     headers: {
@@ -41,7 +95,7 @@ async function falRequest(modelPath, payload) {
     body: JSON.stringify(payload),
   });
 
-  // if unauthorized, try with "Bearer"
+  // fallback
   if (r.status === 401 || r.status === 403) {
     r = await fetch(url, {
       method: "POST",
@@ -56,16 +110,14 @@ async function falRequest(modelPath, payload) {
   const text = await r.text();
   let json = {};
   try { json = text ? JSON.parse(text) : {}; } catch (_) {}
-
   return { ok: r.ok, status: r.status, json, text };
 }
 
 export default async function handler(req, res) {
-  // ✅ CORS — обязательно в самом начале
+  // ✅ CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -75,9 +127,9 @@ export default async function handler(req, res) {
     if (!SUPABASE_URL) missing.push("SUPABASE_URL");
     if (!SUPABASE_ANON_KEY) missing.push("SUPABASE_ANON_KEY");
     if (!process.env.FAL_KEY) missing.push("FAL_KEY");
+    if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
     if (missing.length) return res.status(400).json({ error: "Missing env vars", missing });
 
-    // AUTH
     const token = getBearerToken(req);
     if (!token) return res.status(401).json({ error: "Missing Bearer token" });
 
@@ -85,33 +137,34 @@ export default async function handler(req, res) {
     const userId = user.id;
     const email = user.email || null;
 
-    // body
-    const body = req.body && typeof req.body === "object" ? req.body : {};
-    const presetId = String(body.presetId || "").trim();
-    const scene = String(body.scene || "").trim();
-    const video_url = String(body.video_url || "").trim();
-    const keep_original_sound = String(body.keep_original_sound ?? "true").toLowerCase() === "true";
+    const { fields, files } = await parseForm(req);
+    const presetId = String(pickField(fields, "presetId") || "").trim();
+    const scene = String(pickField(fields, "scene") || "").trim();
+    const keep_original_sound = normalizeBool(pickField(fields, "keep_original_sound") ?? true);
 
     if (!presetId) return res.status(400).json({ error: "presetId required" });
-    if (!video_url) return res.status(400).json({ error: "video_url required" });
 
     const preset = PRESETS[presetId];
     if (!preset) return res.status(400).json({ error: "Unknown preset", presetId });
     if (preset.provider !== "fal") return res.status(400).json({ error: "Preset is not fal", presetId });
 
+    const videoFile = pickFile(files, "video");
+    if (!videoFile) return res.status(400).json({ error: "MP4 required (field name: video)" });
+
+    // basic mime check
+    if (String(videoFile.mimetype || "") !== "video/mp4") {
+      return res.status(400).json({ error: "Only MP4 supported", mimetype: videoFile.mimetype });
+    }
+
+    // upload to storage via service role
+    const video_url = await uploadVideoToSupabase({ userId, file: videoFile });
+
     const prompt = (preset.promptTemplate || "{scene}")
       .replaceAll("{scene}", scene || "edit the video")
       .trim();
 
-    // ✅ fal call
-    const fal = await falRequest(preset.model, {
-      prompt,
-      video_url,
-      keep_original_sound,
-    });
-
+    const fal = await falRequest(preset.model, { prompt, video_url, keep_original_sound });
     if (!fal.ok) {
-      // возвращаем максимально полезную ошибку
       return res.status(400).json({
         error: "fal request failed",
         status: fal.status,
@@ -121,10 +174,9 @@ export default async function handler(req, res) {
 
     const j = fal.json || {};
     const requestId = j.request_id || j.id || null;
-    if (!requestId) {
-      return res.status(400).json({ error: "fal: missing request_id", details: j });
-    }
+    if (!requestId) return res.status(400).json({ error: "fal: missing request_id", details: j });
 
+    // ✅ ВАЖНО: пишем в БД ТОЛЬКО после успешного fal create
     await pool.query(
       `
       insert into public.generations
@@ -142,6 +194,7 @@ export default async function handler(req, res) {
       status: "starting",
       provider: "fal",
       presetId,
+      video_url,
     });
   } catch (e) {
     console.error(e);
