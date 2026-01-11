@@ -145,8 +145,7 @@ export default async function handler(req, res) {
     if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
     if (missing.length) return res.status(400).json({ error: "Missing env vars", missing });
 
-    const token = getBearerToken(req);
-    if (!token) return res.status(401).json({ error: "Missing Bearer token" });
+const token = getBearerToken(req)
 
     const user = await getUserFromSupabase(token);
     const userId = user.id;
