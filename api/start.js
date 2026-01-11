@@ -183,7 +183,68 @@ const prediction = await replicate.predictions.create({
   },
 });
 
+      if (preset.provider === "fal") {
+  if (!process.env.FAL_KEY) {
+    return res.status(400).json({ error: "Missing env vars", missing: ["FAL_KEY"] });
+  }
 
+  const prompt = (preset.promptTemplate || "{scene}")
+    .replaceAll("{scene}", scene || "edit the video")
+    .trim();
+
+  const video_url = String(pickField(fields, "video_url") || "").trim();
+  if (!video_url) {
+    return res.status(400).json({ error: "video_url required (public URL to mp4)" });
+  }
+
+  // optional toggles
+  const keep_original_sound = normalizeBool(pickField(fields, "keep_original_sound") ?? true);
+
+  // fal.ai API call (async)
+  const r = await fetch(`https://fal.run/${preset.model}`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Key ${process.env.FAL_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      prompt,
+      video_url,
+      keep_original_sound,
+    }),
+  });
+
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    return res.status(400).json({ error: "fal request failed", details: j });
+  }
+
+  // fal returns request_id for async jobs (обычно так)
+  const requestId = j.request_id || j.id || null;
+  if (!requestId) {
+    return res.status(400).json({ error: "fal: missing request_id", details: j });
+  }
+
+  await pool.query(
+    `
+    insert into public.generations
+      (user_id, preset_id, replicate_prediction_id, model, prompt, status)
+    values
+      ($1, $2, $3, $4, $5, $6)
+    `,
+    [userId, presetId, requestId, preset.model, prompt, "starting"]
+  );
+
+  return res.status(200).json({
+    ok: true,
+    jobId: requestId,
+    status: "starting",
+    provider: preset.provider,
+    presetId,
+  });
+}
+
+      
       await pool.query(
         `
         insert into public.generations
