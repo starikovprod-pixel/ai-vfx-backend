@@ -14,6 +14,23 @@ function getBearerToken(req) {
   return auth.startsWith("Bearer ") ? auth.slice(7) : "";
 }
 
+function setCors(req, res) {
+  // ✅ конкретный origin (стабильнее, чем "*")
+  const origin = String(req.headers.origin || "");
+
+  const allow =
+    origin === "https://lightfull.ai" ||
+    origin === "https://api.lightfull.ai"
+      ? origin
+      : "https://lightfull.ai";
+
+  res.setHeader("Access-Control-Allow-Origin", allow);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
+
 async function getUserFromSupabase(accessToken) {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY");
@@ -70,11 +87,8 @@ async function uploadVideoToSupabase({ userId, file }) {
   }
 
   const buf = fs.readFileSync(file.filepath || file.path);
-
   const path = `${userId}/${Date.now()}-${Math.random().toString(16).slice(2)}.mp4`;
 
-  // Storage REST API:
-  // POST /storage/v1/object/<bucket>/<path>
   const uploadUrl = `${SUPABASE_URL}/storage/v1/object/inputs_video/${encodeURIComponent(path)}`;
 
   const r = await fetch(uploadUrl, {
@@ -89,13 +103,9 @@ async function uploadVideoToSupabase({ userId, file }) {
   });
 
   const text = await r.text();
-  if (!r.ok) {
-    throw new Error(`Supabase storage upload failed: ${r.status} ${text}`);
-  }
+  if (!r.ok) throw new Error(`Supabase storage upload failed: ${r.status} ${text}`);
 
-  // public URL (bucket должен быть PUBLIC)
-  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/inputs_video/${encodeURIComponent(path)}`;
-  return publicUrl;
+  return `${SUPABASE_URL}/storage/v1/object/public/inputs_video/${encodeURIComponent(path)}`;
 }
 
 async function falRequest(modelPath, payload) {
@@ -110,6 +120,7 @@ async function falRequest(modelPath, payload) {
     body: JSON.stringify(payload),
   });
 
+  // fallback
   if (r.status === 401 || r.status === 403) {
     r = await fetch(url, {
       method: "POST",
@@ -128,10 +139,8 @@ async function falRequest(modelPath, payload) {
 }
 
 export default async function handler(req, res) {
-  // ✅ CORS (ставим сразу)
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  // ✅ CORS всегда первым делом
+  setCors(req, res);
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -145,7 +154,8 @@ export default async function handler(req, res) {
     if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
     if (missing.length) return res.status(400).json({ error: "Missing env vars", missing });
 
-const token = getBearerToken(req)
+    const token = getBearerToken(req);
+    if (!token) return res.status(401).json({ error: "Missing Bearer token" });
 
     const user = await getUserFromSupabase(token);
     const userId = user.id;
@@ -170,7 +180,6 @@ const token = getBearerToken(req)
       return res.status(400).json({ error: "Only MP4 supported", mimetype: videoFile.mimetype });
     }
 
-    // ✅ upload mp4 via service_role (не зависит от policy на клиенте)
     const video_url = await uploadVideoToSupabase({ userId, file: videoFile });
 
     const prompt = (preset.promptTemplate || "{scene}")
@@ -192,7 +201,6 @@ const token = getBearerToken(req)
     const requestId = j.request_id || j.id || null;
     if (!requestId) return res.status(400).json({ error: "fal: missing request_id", details: j });
 
-    // ✅ пишем в БД только после успешного fal
     await pool.query(
       `
       insert into public.generations
@@ -214,6 +222,7 @@ const token = getBearerToken(req)
     });
   } catch (e) {
     console.error(e);
+    // ✅ даже на ошибке CORS уже стоит, т.к. мы setCors сделали первым
     return res.status(500).json({ error: "Internal error", details: String(e?.message || e) });
   }
 }
