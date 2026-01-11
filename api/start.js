@@ -160,33 +160,29 @@ export default async function handler(req, res) {
         .replaceAll("{scene}", scene || "high quality, detailed")
         .trim();
 
-      // Nano: принимает image_input[] (можно пусто)
-      const imageFiles = [
-  ...pickFiles(files, "image_input"),
-  ...pickFiles(files, "image"),
-];
-      const image_input = imageFiles.length
-  ? imageFiles.slice(0, 14).map(fileToDataUri)
-  : undefined;
+// Nano: теперь принимаем URL (а не файл/base64)
+const image_input_url = String(pickField(fields, "image_input_url") || "").trim();
+const image_input = image_input_url ? [image_input_url] : undefined;
 
-      const aspect_ratio = String(pickField(fields, "aspect_ratio") || preset.aspect_ratio || "match_input_image");
-      const resolution = String(pickField(fields, "resolution") || preset.resolution || "2K");
-      const output_format = String(pickField(fields, "output_format") || preset.output_format || "png");
-      const safety_filter_level = String(
-        pickField(fields, "safety_filter_level") || preset.safety_filter_level || "block_only_high"
-      );
+const aspect_ratio = String(pickField(fields, "aspect_ratio") || preset.aspect_ratio || "match_input_image");
+const resolution = String(pickField(fields, "resolution") || preset.resolution || "2K");
+const output_format = String(pickField(fields, "output_format") || preset.output_format || "png");
+const safety_filter_level = String(
+  pickField(fields, "safety_filter_level") || preset.safety_filter_level || "block_only_high"
+);
 
-      const prediction = await replicate.predictions.create({
-        model: preset.model, // "google/nano-banana-pro"
-        input: {
-          prompt,
-          image_input, // может быть []
-          aspect_ratio,
-          resolution,
-          output_format,
-          safety_filter_level,
-        },
-      });
+const prediction = await replicate.predictions.create({
+  model: preset.model, // "google/nano-banana-pro"
+  input: {
+    prompt,
+    ...(image_input ? { image_input } : {}),
+    aspect_ratio,
+    resolution,
+    output_format,
+    safety_filter_level,
+  },
+});
+
 
       await pool.query(
         `
