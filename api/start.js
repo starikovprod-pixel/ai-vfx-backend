@@ -159,8 +159,13 @@ export default async function handler(req, res) {
         .trim();
 
       // Nano: принимает image_input[] (можно пусто)
-      const imageFiles = pickFiles(files, "image_input"); // ✅ поле назовём image_input на фронте
-      const image_input = imageFiles.slice(0, 14).map(fileToDataUri);
+      const imageFiles = [
+  ...pickFiles(files, "image_input"),
+  ...pickFiles(files, "image"),
+];
+      const image_input = imageFiles.length
+  ? imageFiles.slice(0, 14).map(fileToDataUri)
+  : undefined;
 
       const aspect_ratio = String(pickField(fields, "aspect_ratio") || preset.aspect_ratio || "match_input_image");
       const resolution = String(pickField(fields, "resolution") || preset.resolution || "2K");
