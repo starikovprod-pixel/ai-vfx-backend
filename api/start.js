@@ -32,10 +32,12 @@ async function getUserFromSupabase(accessToken) {
 }
 
 function parseForm(req) {
-  const form = formidable({
-    multiples: true,         // ✅ важно: Nano может принимать несколько картинок
-    keepExtensions: true,
-  });
+const form = formidable({
+  multiples: true,
+  keepExtensions: true,
+  maxFileSize: 20 * 1024 * 1024, // 20MB
+});
+
 
   return new Promise((resolve, reject) => {
     form.parse(req, (err, fields, files) => {
